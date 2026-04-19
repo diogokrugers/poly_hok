@@ -1,7 +1,7 @@
 all: priv/gpu_nifs.so 
 
 priv/gpu_nifs.so: c_src/gpu_nifs.cu
-	nvcc --shared -g -lcuda -lnvrtc --compiler-options '-fPIC' -o priv/gpu_nifs.so c_src/gpu_nifs.cu -ccbin gcc-10
+	nvcc --shared -g -lcuda -lnvrtc -lpthread --compiler-options '-fPIC' -o priv/gpu_nifs.so c_src/gpu_nifs.cu -ccbin gcc-10
 
 
 bmp: c_src/bmp_nifs.cu 

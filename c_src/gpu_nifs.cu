@@ -9,8 +9,67 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <nvrtc.h>
+#include <pthread.h>
+#include <string.h>
 
 CUcontext  context = NULL;
+
+/* ================================================================
+ * KERNEL CACHE — evita recompilação NVRTC a cada chamada
+ * Mapeia source_code → (CUmodule + CUfunction)
+ * Thread-safe via pthread_mutex
+ * ================================================================ */
+
+#define KERNEL_CACHE_SLOTS 512   /* potência de 2 */
+
+typedef struct {
+    uint64_t   hash;      /* FNV-1a do source; 0 = slot vazio    */
+    char      *source;    /* strdup do source (NULL = vazio)      */
+    CUmodule   module;
+    CUfunction function;
+} KernelCacheEntry;
+
+static KernelCacheEntry g_kcache[KERNEL_CACHE_SLOTS];
+static pthread_mutex_t  g_kcache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* FNV-1a 64-bit */
+static uint64_t fnv1a(const char *s) {
+    uint64_t h = 14695981039346656037ULL;
+    while (*s) { h ^= (uint8_t)(*s++); h *= 1099511628211ULL; }
+    return h;
+}
+
+/* Procura no cache. Deve ser chamado COM o mutex. */
+static CUfunction kcache_lookup(const char *src, uint64_t hash) {
+    uint32_t slot = (uint32_t)(hash & (KERNEL_CACHE_SLOTS - 1));
+    for (int i = 0; i < KERNEL_CACHE_SLOTS; i++) {
+        uint32_t idx = (slot + i) & (KERNEL_CACHE_SLOTS - 1);
+        KernelCacheEntry *e = &g_kcache[idx];
+        if (e->source == NULL)   return NULL;  /* slot vazio */
+        if (e->hash == hash && strcmp(e->source, src) == 0)
+            return e->function;                /* cache hit  */
+    }
+    return NULL;  /* tabela cheia (impossível com 512 slots e <20 kernels) */
+}
+
+/* Armazena no cache. Deve ser chamado COM o mutex. */
+static void kcache_store(const char *src, uint64_t hash,
+                         CUmodule mod, CUfunction fn) {
+    uint32_t slot = (uint32_t)(hash & (KERNEL_CACHE_SLOTS - 1));
+    for (int i = 0; i < KERNEL_CACHE_SLOTS; i++) {
+        uint32_t idx = (slot + i) & (KERNEL_CACHE_SLOTS - 1);
+        KernelCacheEntry *e = &g_kcache[idx];
+        if (e->source == NULL) {
+            e->hash     = hash;
+            e->source   = strdup(src);   /* cópia permanente no heap */
+            e->module   = mod;
+            e->function = fn;
+            return;
+        }
+    }
+    /* tabela cheia — ignora silenciosamente (próxima chamada recompila) */
+}
+
 void init_cuda(ErlNifEnv *env)
 {
   if (context == NULL)
@@ -275,21 +334,40 @@ static ERL_NIF_TERM jit_compile_and_launch_nif(ErlNifEnv *env, int argc, const E
   // printf("%s\n",code);
    //printf("Args: %d %d %d %d %d %d\n",b1,b2,b3,t1,t2,t3);
  
-  char* ptx = compile_to_ptx(env,code);
- 
-  init_cuda(env);
- // int device =0;
- // CUcontext  context2 = NULL;
- // err = cuCtxCreate(&context2, 0, device);
-  err = cuModuleLoadDataEx(&module,  ptx, 0, 0, 0);
- //printf("after module load\n");
-  if (err != CUDA_SUCCESS) fail_cuda(env,err,"cuModuleLoadData jit compile");
-
-  // And here is how you use your compiled PTX
- 
-  err = cuModuleGetFunction(&function, module, kernel_name);
-//printf("after get funcction\n");
-  if (err != CUDA_SUCCESS) fail_cuda(env,err,"cuModuleGetFunction jit compile");
+  /* ----------------------------------------------------------
+   * KERNEL CACHE: compila apenas uma vez por source único.
+   * Cache hit: pula NVRTC (~100ms economizados por chamada).
+   * ---------------------------------------------------------- */
+  {
+    uint64_t src_hash = fnv1a(code);
+    pthread_mutex_lock(&g_kcache_mutex);
+    function = kcache_lookup(code, src_hash);
+    if (function == NULL) {
+      /* Cache miss — compilar agora */
+      char* ptx = compile_to_ptx(env, code);
+      init_cuda(env);
+      err = cuModuleLoadDataEx(&module, ptx, 0, 0, 0);
+      delete[] ptx;                              /* libera PTX imediatamente */
+      if (err != CUDA_SUCCESS) {
+        pthread_mutex_unlock(&g_kcache_mutex);
+        fail_cuda(env, err, "cuModuleLoadData jit compile");
+        return enif_make_int(env, 0);
+      }
+      err = cuModuleGetFunction(&function, module, kernel_name);
+      if (err != CUDA_SUCCESS) {
+        pthread_mutex_unlock(&g_kcache_mutex);
+        fail_cuda(env, err, "cuModuleGetFunction jit compile");
+        return enif_make_int(env, 0);
+      }
+      kcache_store(code, src_hash, module, function);
+      /* Descomente para depurar: */
+      /* printf("[kcache] compiled & cached: %s\n", kernel_name); */
+    } else {
+      /* Descomente para depurar: */
+      /* printf("[kcache] hit: %s\n", kernel_name); */
+    }
+    pthread_mutex_unlock(&g_kcache_mutex);
+  }
 
 
   void *args[size_args];
@@ -1654,3 +1732,4 @@ static ErlNifFunc nif_funcs[] = {
 };
 
 ERL_NIF_INIT(Elixir.PolyHok, nif_funcs, &load, NULL, NULL, NULL)
+
