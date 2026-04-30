@@ -1712,6 +1712,305 @@ static ERL_NIF_TERM spawn_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[
   return enif_make_int(env, 0);
 }
 
+
+/* ================================================================
+ * FLAWD_LIST — Functional Lists All The Way Down
+ *
+ * Otimizações aplicadas:
+ *   1. Linearização direta em C — zero alocações no BEAM
+ *   2. Software prefetch (__builtin_prefetch) com lookahead de 8 nós
+ *      sobre os ponteiros taggeados das cons cells do BEAM
+ *   3. Pinned (page-locked) memory via cudaMallocHost — DMA direto,
+ *      sem cópia de staging buffer pelo driver
+ *   4. cudaMemcpyAsync + stream dedicada — H2D e D2H não bloqueiam
+ *      o scheduler do BEAM desnecessariamente
+ *   5. Reconstrução da lista resultado inteiramente em C —
+ *      zero overhead de decode binário em Elixir
+ * ================================================================ */
+
+#define FLAWD_PREFETCH_DIST 8
+
+/* ---------------------------------------------------------------
+ * Stream CUDA global reutilizada entre chamadas
+ * --------------------------------------------------------------- */
+static cudaStream_t g_flawd_stream          = NULL;
+static pthread_mutex_t g_flawd_stream_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static cudaStream_t flawd_get_stream(void) {
+    pthread_mutex_lock(&g_flawd_stream_mutex);
+    if (g_flawd_stream == NULL) {
+        cudaStreamCreate(&g_flawd_stream);
+    }
+    pthread_mutex_unlock(&g_flawd_stream_mutex);
+    return g_flawd_stream;
+}
+
+/* ---------------------------------------------------------------
+ * Pinned Buffer Pool
+ *
+ * Problema resolvido: cudaMallocHost/cudaFreeHost custam ~2-3ms
+ * cada. Chamadas por operação (new + get) somavam ~5-6ms de piso
+ * fixo, dominando o benchmark para todos os tamanhos pequenos.
+ *
+ * Solução: dois buffers pinned persistentes (H2D e D2H), alocados
+ * uma única vez e reutilizados via acquire/release com mutex.
+ * Se uma requisição precisar de mais espaço que o buffer atual,
+ * o buffer cresce (cudaFreeHost + cudaMallocHost) — "grow-only".
+ *
+ * Modelo de concorrência: serialize por pool (segunda chamada
+ * concorrente espera a primeira liberar). Para workloads
+ * paralelos intensos um pool de N slots seria melhor, mas este
+ * modelo já elimina o overhead para o caso sequencial (benchmark).
+ * --------------------------------------------------------------- */
+typedef struct {
+    void            *buf;
+    size_t           capacity;
+    pthread_mutex_t  lock;
+} PinnedPool;
+
+/* Pool H2D: usado em new_flawd_list_nif */
+static PinnedPool g_flawd_h2d = {NULL, 0, PTHREAD_MUTEX_INITIALIZER};
+/* Pool D2H: usado em get_flawd_list_nif */
+static PinnedPool g_flawd_d2h = {NULL, 0, PTHREAD_MUTEX_INITIALIZER};
+
+/* Adquire o buffer do pool, crescendo se necessário.
+ * Retorna NULL em caso de falha de alocação.
+ * IMPORTANTE: o chamador DEVE invocar pinned_pool_release() após o uso. */
+static void* pinned_pool_acquire(PinnedPool *pool, size_t needed) {
+    pthread_mutex_lock(&pool->lock);
+    if (pool->capacity < needed) {
+        if (pool->buf != NULL) {
+            cudaFreeHost(pool->buf);
+            pool->buf      = NULL;
+            pool->capacity = 0;
+        }
+        cudaError_t e = cudaMallocHost(&pool->buf, needed);
+        if (e != cudaSuccess) {
+            pthread_mutex_unlock(&pool->lock);
+            return NULL;   /* caller verifica e reporta erro */
+        }
+        pool->capacity = needed;
+    }
+    return pool->buf;    /* mutex permanece travado até release */
+}
+
+/* Libera o pool para o próximo chamador. */
+static void pinned_pool_release(PinnedPool *pool) {
+    pthread_mutex_unlock(&pool->lock);
+}
+
+/* ---------------------------------------------------------------
+ * new_flawd_list_nif(list, rows, cols, type_charlist)
+ *
+ * Percorre a lista Elixir em C com prefetch de ponteiros de cons
+ * cells, serializa direto em pinned memory e transfere para GPU
+ * via cudaMemcpyAsync.
+ * Retorna resource idêntico ao ARRAY_TYPE dos outros NIFs —
+ * compatível com Ske.map/reduce sem nenhuma mudança.
+ * --------------------------------------------------------------- */
+static ERL_NIF_TERM new_flawd_list_nif(ErlNifEnv *env, int argc,
+                                        const ERL_NIF_TERM argv[]) {
+    int rows, cols;
+    if (!enif_get_int(env, argv[1], &rows)) return enif_make_badarg(env);
+    if (!enif_get_int(env, argv[2], &cols)) return enif_make_badarg(env);
+
+    unsigned int type_slen;
+    if (!enif_get_list_length(env, argv[3], &type_slen)) return enif_make_badarg(env);
+    char type_name[64];
+    enif_get_string(env, argv[3], type_name, sizeof(type_name), ERL_NIF_LATIN1);
+
+    int n = rows * cols;
+    if (n <= 0) return enif_make_badarg(env);
+
+    size_t elem_size;
+    if      (strcmp(type_name, "int")    == 0) elem_size = sizeof(int32_t);
+    else if (strcmp(type_name, "float")  == 0) elem_size = sizeof(float);
+    else if (strcmp(type_name, "double") == 0) elem_size = sizeof(double);
+    else return enif_make_badarg(env);
+
+    size_t data_size = (size_t)n * elem_size;
+
+    /* ---- 1. Adquire buffer pinned do pool (sem cudaMallocHost repetido) ---- */
+    void *h_buf = pinned_pool_acquire(&g_flawd_h2d, data_size);
+    if (h_buf == NULL) {
+        return enif_raise_exception(env,
+            enif_make_string(env,
+                "new_flawd_list_nif: pinned_pool_acquire falhou (cudaMallocHost)",
+                ERL_NIF_LATIN1));
+    }
+
+    /* ---- 2. Linearização com software prefetch ---- */
+    ERL_NIF_TERM cur      = argv[0];
+    ERL_NIF_TERM head, tail;
+    ERL_NIF_TERM lookahead = argv[0];
+    ERL_NIF_TERM la_head, la_tail;
+
+    /* Avança lookahead FLAWD_PREFETCH_DIST passos emitindo prefetches */
+    for (int k = 0; k < FLAWD_PREFETCH_DIST; k++) {
+        if (!enif_get_list_cell(env, lookahead, &la_head, &la_tail)) break;
+        /* tag BEAM: 2 LSBs são tipo; endereco real = term & ~0x3 */
+        __builtin_prefetch((void*)((uintptr_t)la_tail & ~0x3UL), 0, 1);
+        lookahead = la_tail;
+    }
+
+    if (strcmp(type_name, "int") == 0) {
+        int32_t *buf = (int32_t*)h_buf;
+        for (int i = 0; i < n; i++) {
+            if (!enif_get_list_cell(env, cur, &head, &tail)) break;
+            if (enif_get_list_cell(env, lookahead, &la_head, &la_tail)) {
+                __builtin_prefetch((void*)((uintptr_t)la_tail & ~0x3UL), 0, 1);
+                lookahead = la_tail;
+            }
+            long val = 0; enif_get_int64(env, head, &val);
+            buf[i] = (int32_t)val;
+            cur = tail;
+        }
+    } else if (strcmp(type_name, "float") == 0) {
+        float *buf = (float*)h_buf;
+        for (int i = 0; i < n; i++) {
+            if (!enif_get_list_cell(env, cur, &head, &tail)) break;
+            if (enif_get_list_cell(env, lookahead, &la_head, &la_tail)) {
+                __builtin_prefetch((void*)((uintptr_t)la_tail & ~0x3UL), 0, 1);
+                lookahead = la_tail;
+            }
+            double val = 0.0; enif_get_double(env, head, &val);
+            buf[i] = (float)val;
+            cur = tail;
+        }
+    } else {  /* double */
+        double *buf = (double*)h_buf;
+        for (int i = 0; i < n; i++) {
+            if (!enif_get_list_cell(env, cur, &head, &tail)) break;
+            if (enif_get_list_cell(env, lookahead, &la_head, &la_tail)) {
+                __builtin_prefetch((void*)((uintptr_t)la_tail & ~0x3UL), 0, 1);
+                lookahead = la_tail;
+            }
+            double val = 0.0; enif_get_double(env, head, &val);
+            buf[i] = val;
+            cur = tail;
+        }
+    }
+
+    /* ---- 3. Aloca device memory e transfere de forma assíncrona ---- */
+    init_cuda(env);
+    CUdeviceptr dev_array;
+    CUresult err = cuMemAlloc(&dev_array, data_size);
+    if (err != CUDA_SUCCESS) {
+        pinned_pool_release(&g_flawd_h2d);
+        fail_cuda(env, err, "new_flawd_list_nif: cuMemAlloc");
+        return enif_make_int(env, 0);
+    }
+
+    cudaStream_t stream = flawd_get_stream();
+    cudaError_t cerr = cudaMemcpyAsync((void*)dev_array, h_buf, data_size,
+                            cudaMemcpyHostToDevice, stream);
+    if (cerr != cudaSuccess) {
+        pinned_pool_release(&g_flawd_h2d);
+        cuMemFree(dev_array);
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "new_flawd_list_nif: cudaMemcpyAsync H2D: %s",
+                 cudaGetErrorString(cerr));
+        return enif_raise_exception(env,
+                    enif_make_string(env, msg, ERL_NIF_LATIN1));
+    }
+
+    /* Aguarda transferência antes de liberar o buffer do pool */
+    cudaStreamSynchronize(stream);
+    pinned_pool_release(&g_flawd_h2d);
+
+    /* ---- 4. Empacota como resource NIF (compatível com ARRAY_TYPE) ---- */
+    CUdeviceptr *gpu_res = (CUdeviceptr*)enif_alloc_resource(
+                                ARRAY_TYPE, sizeof(CUdeviceptr));
+    *gpu_res = dev_array;
+    ERL_NIF_TERM term = enif_make_resource(env, gpu_res);
+    enif_release_resource(gpu_res);
+    return term;
+}
+
+/* ---------------------------------------------------------------
+ * get_flawd_list_nif(ref, n, type_charlist)
+ *
+ * D2H via pinned memory assíncrona.
+ * Reconstrói a lista Elixir inteiramente em C (de trás pra frente)
+ * — sem nenhum decode de binário em Elixir.
+ * --------------------------------------------------------------- */
+static ERL_NIF_TERM get_flawd_list_nif(ErlNifEnv *env, int argc,
+                                        const ERL_NIF_TERM argv[]) {
+    CUdeviceptr *array_res;
+    if (!enif_get_resource(env, argv[0], ARRAY_TYPE, (void**)&array_res))
+        return enif_make_badarg(env);
+
+    int n;
+    if (!enif_get_int(env, argv[1], &n)) return enif_make_badarg(env);
+    if (n <= 0) return enif_make_badarg(env);
+
+    unsigned int type_slen;
+    if (!enif_get_list_length(env, argv[2], &type_slen)) return enif_make_badarg(env);
+    char type_name[64];
+    enif_get_string(env, argv[2], type_name, sizeof(type_name), ERL_NIF_LATIN1);
+
+    size_t elem_size;
+    if      (strcmp(type_name, "int")    == 0) elem_size = sizeof(int32_t);
+    else if (strcmp(type_name, "float")  == 0) elem_size = sizeof(float);
+    else if (strcmp(type_name, "double") == 0) elem_size = sizeof(double);
+    else return enif_make_badarg(env);
+
+    size_t data_size = (size_t)n * elem_size;
+
+    /* ---- 1. Adquire buffer pinned do pool D2H ---- */
+    void *h_buf = pinned_pool_acquire(&g_flawd_d2h, data_size);
+    if (h_buf == NULL) {
+        return enif_raise_exception(env,
+            enif_make_string(env,
+                "get_flawd_list_nif: pinned_pool_acquire falhou (cudaMallocHost)",
+                ERL_NIF_LATIN1));
+    }
+
+    /* ---- 2. D2H assíncrono ---- */
+    cudaStream_t stream = flawd_get_stream();
+    cudaError_t cerr = cudaMemcpyAsync(h_buf, (const void*)*array_res, data_size,
+                            cudaMemcpyDeviceToHost, stream);
+    if (cerr != cudaSuccess) {
+        pinned_pool_release(&g_flawd_d2h);
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "get_flawd_list_nif: cudaMemcpyAsync D2H: %s",
+                 cudaGetErrorString(cerr));
+        return enif_raise_exception(env,
+                    enif_make_string(env, msg, ERL_NIF_LATIN1));
+    }
+    cudaStreamSynchronize(stream);
+
+    /* ---- 3. Reconstrói lista Elixir de trás pra frente em C ----
+     * Construir de trás pra frente é O(n) sem reversão posterior.
+     * Cons cell = [H | T], então para lista [a,b,c]:
+     *   lista = cons(a, cons(b, cons(c, [])))
+     * construída como: [] → cons(c,[]) → cons(b,...) → cons(a,...)
+     * ------------------------------------------------------------ */
+    ERL_NIF_TERM result = enif_make_list(env, 0);  /* [] */
+
+    if (strcmp(type_name, "int") == 0) {
+        int32_t *buf = (int32_t*)h_buf;
+        for (ssize_t i = (ssize_t)n - 1; i >= 0; i--)
+            result = enif_make_list_cell(env,
+                         enif_make_int(env, (int)buf[i]), result);
+    } else if (strcmp(type_name, "float") == 0) {
+        float *buf = (float*)h_buf;
+        for (ssize_t i = (ssize_t)n - 1; i >= 0; i--)
+            result = enif_make_list_cell(env,
+                         enif_make_double(env, (double)buf[i]), result);
+    } else {
+        double *buf = (double*)h_buf;
+        for (ssize_t i = (ssize_t)n - 1; i >= 0; i--)
+            result = enif_make_list_cell(env,
+                         enif_make_double(env, buf[i]), result);
+    }
+
+    pinned_pool_release(&g_flawd_d2h);
+    return result;
+}
+
 static ErlNifFunc nif_funcs[] = {
     {"jit_compile_and_launch_nif",7,jit_compile_and_launch_nif},
     {"new_gpu_array_nif", 3, new_gpu_array_nif},
@@ -1728,7 +2027,9 @@ static ErlNifFunc nif_funcs[] = {
     {"create_ref_nif", 1, create_ref_nif},
     {"new_ref_nif", 1, new_ref_nif},
     {"get_matrex_nif", 3, get_matrex_nif},
-    {"synchronize_nif", 0, synchronize_nif}
+    {"synchronize_nif", 0, synchronize_nif},
+    {"new_flawd_list_nif", 4, new_flawd_list_nif},
+    {"get_flawd_list_nif", 3, get_flawd_list_nif}
 };
 
 ERL_NIF_INIT(Elixir.PolyHok, nif_funcs, &load, NULL, NULL, NULL)

@@ -954,6 +954,7 @@ def jit_compile_and_launch_nif(_n,_k,_t,_b,_size,_types,_l) do
   raise "NIF jit_compile_and_launch_nif/7 not implemented"
 end
 
+
 #######################################
 ##  glist biz
 #######################################
@@ -999,5 +1000,58 @@ defp glist_binary_to_list(binary, type) do
     _ -> raise "Tipo não suportado: #{inspect(type)}"
   end
 end
+
+
+ #######################################
+  ##  flawd_list — Functional Lists All The Way Down
+  ##
+  ##  Otimizações em relação ao glist:
+  ##    1. Linearização direta em NIF C (sem List.flatten nem binary
+  ##       comprehension no BEAM)
+  ##    2. Software prefetch sobre cons cells do BEAM
+  ##    3. Pinned (page-locked) memory para H2D e D2H via DMA direto
+  ##    4. cudaMemcpyAsync + stream CUDA dedicada e reutilizada
+  ##    5. Reconstrução da lista resultado inteiramente em C
+  ##       (sem decode de binário em Elixir)
+  ##
+  ##  API compatível com new_glist / get_glist — usa o mesmo
+  ##  formato interno {:nx, type, shape, names, ref} e é compatível
+  ##  com Ske.map/reduce sem nenhuma mudança no lado dos kernels.
+  #######################################
+
+  # Cria um array GPU a partir de uma lista Elixir via NIF C otimizado.
+  # shape deve ser {rows, cols} (ex: {1, n} para lista 1D).
+  def new_flawd_list(list, shape, type) do
+    {rows, cols} = shape
+    type_str = case type do
+      {:f, 32} -> to_charlist("float")
+      {:f, 64} -> to_charlist("double")
+      {:s, 32} -> to_charlist("int")
+      _        -> raise "new_flawd_list: tipo não suportado: #{inspect(type)}"
+    end
+    ref = new_flawd_list_nif(list, rows, cols, type_str)
+    {:nx, type, shape, [nil, nil], ref}
+  end
+
+  # Transfere resultado da GPU de volta para uma lista Elixir nativa.
+  # A lista é reconstruída inteiramente em C — sem decode de binário.
+  def get_flawd_list({:nx, type, shape, _names, ref}) do
+    {rows, cols} = shape
+    n = rows * cols
+    type_str = case type do
+      {:f, 32} -> to_charlist("float")
+      {:f, 64} -> to_charlist("double")
+      {:s, 32} -> to_charlist("int")
+      _        -> raise "get_flawd_list: tipo não suportado: #{inspect(type)}"
+    end
+    get_flawd_list_nif(ref, n, type_str)
+  end
+
+  # ---- NIF stubs (substituídos automaticamente quando o .so é carregado) ----
+  def new_flawd_list_nif(_list, _rows, _cols, _type),
+    do: raise("NIF new_flawd_list_nif/4 não carregado — rode `make` primeiro")
+
+  def get_flawd_list_nif(_ref, _n, _type),
+    do: raise("NIF get_flawd_list_nif/3 não carregado — rode `make` primeiro")
 
 end
