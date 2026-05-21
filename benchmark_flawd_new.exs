@@ -6,7 +6,7 @@ require PolyHok
 use Ske
 
 defmodule BenchFlawdNew do
-  @sizes      [1_000, 10_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000]
+  @sizes      [1_000, 10_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000, 5_000_000]
   @iterations 7
   @type_float {:f, 32}
   @warmup_n   10_000
