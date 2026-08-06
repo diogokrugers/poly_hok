@@ -1054,4 +1054,70 @@ end
   def get_flawd_list_nif(_ref, _n, _type),
     do: raise("NIF get_flawd_list_nif/3 não carregado — rode `make` primeiro")
 
+  #######################################
+  ##  flawd_ref — Lista Persistente na GPU
+  ##
+  ##  Problema resolvido: cada operação sobre flawd hoje faz:
+  ##
+  ##    lista → new_flawd_list (H2D) → kernel → get_flawd_list (D2H) → lista
+  ##
+  ##  Numa pipeline map |> map |> reduce isso são 3 H2D + 3 D2H.
+  ##  Os D2H intermediários são completamente desnecessários — o dado
+  ##  poderia ficar na GPU entre operações.
+  ##
+  ##  Solução: {:flawd_ref, gnx} é um wrapper que carrega o {:nx,...}
+  ##  GNx internamente. As operações flawd_map/flawd_reduce passam esse
+  ##  GNx diretamente para Ske.map/Ske.reduce sem nenhum roundtrip.
+  ##  O dado só desce da GPU quando flawd_to_list é chamado.
+  ##
+  ##  Não há nenhum resource C novo — o GNx existente já tem destrutor,
+  ##  já usa o DevicePool e já é gerenciado pelo GC do BEAM.
+  ##
+  ##  API:
+  ##    list_to_flawd(list, n, type) → {:flawd_ref, gnx}
+  ##    flawd_map(flawd_ref, f)      → {:flawd_ref, gnx}
+  ##    flawd_reduce(flawd_ref, initial, f) → {:flawd_ref, gnx}
+  ##    flawd_to_list(flawd_ref)     → lista Elixir nativa
+  ##
+  ##  Pipeline exemplo (zero D2H intermediários):
+  ##
+  ##    list
+  ##    |> PolyHok.list_to_flawd(n, {:f, 32})
+  ##    |> PolyHok.flawd_map(PolyHok.phok fn x -> x * x end)
+  ##    |> PolyHok.flawd_reduce(0.0, PolyHok.phok fn x, acc -> acc + x end)
+  ##    |> PolyHok.flawd_to_list()
+  #######################################
+
+  @doc """
+  Sobe uma lista Elixir para a GPU retornando um handle persistente.
+  O dado permanece na GPU até `flawd_to_list/1` ser chamado.
+  """
+  def list_to_flawd(list, n, type) do
+    gnx = new_flawd_list(list, {1, n}, type)
+    {:flawd_ref, gnx}
+  end
+
+  @doc """
+  Aplica f a cada elemento na GPU. O resultado permanece na GPU.
+  """
+  def flawd_map({:flawd_ref, gnx}, f) do
+    {:flawd_ref, Ske.map(gnx, f)}
+  end
+
+  @doc """
+  Reduz o flawd_ref para um único valor na GPU. Resultado permanece na GPU.
+  Chame flawd_to_list/1 para materializar o escalar em lista de 1 elemento.
+  """
+  def flawd_reduce({:flawd_ref, gnx}, initial, f) do
+    {:flawd_ref, Ske.reduce(gnx, initial, f)}
+  end
+
+  @doc """
+  Materializa o flawd_ref de volta para uma lista Elixir nativa.
+  Após esta chamada o GNx interno pode ser coletado pelo GC do BEAM.
+  """
+  def flawd_to_list({:flawd_ref, gnx}) do
+    get_flawd_list(gnx)
+  end
+
 end
