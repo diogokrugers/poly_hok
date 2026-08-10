@@ -17,7 +17,7 @@ PolyHok.defmodule Ske do
   #     IO.puts "You are USIng!"
   #    end
 
-  include CAS_Poly
+  PolyHok.include CAS_Poly
 
   #######################################
   ##  Suporte a listas Elixir nativas (flawd)
@@ -48,17 +48,12 @@ PolyHok.defmodule Ske do
   ##  o programador nunca precisa tocar em nada além de listas.
   #######################################
 
-  # Tipo default usado para listas Elixir de inteiros quando nenhuma
-  # informação de tipo está disponível. Listas cujo primeiro elemento
-  # não-nil for float usam {:f, 32} automaticamente.
-  @default_list_int_type {:s, 32}
-  @default_list_float_type {:f, 32}
-
-  defp list_data_arg?(list) when is_list(list), do: true
-  defp list_data_arg?(_), do: false
+  # não usada no momento, mantida comentada
+  # defp list_data_arg?(list) when is_list(list), do: true
+  # defp list_data_arg?(_), do: false
 
   # Infere {rows, cols, type} de uma lista Elixir 1D ou 2D (lista de listas).
-  defp infer_list_shape_and_type(list) do
+  def infer_list_shape_and_type(list) do
     case list do
       [h | _] when is_list(h) ->
         rows = length(list)
@@ -73,17 +68,18 @@ PolyHok.defmodule Ske do
     end
   end
 
-  defp infer_elem_type([]), do: @default_list_int_type
-  defp infer_elem_type([x | rest]) do
+  # Tipo default: {:s, 32} para inteiros, {:f, 32} assim que um float é encontrado
+  def infer_elem_type([]), do: {:s, 32}
+  def infer_elem_type([x | rest]) do
     cond do
-      is_float(x) -> @default_list_float_type
-      is_integer(x) -> @default_list_int_type
+      is_float(x) -> {:f, 32}
+      is_integer(x) -> {:s, 32}
       true -> infer_elem_type(rest)
     end
   end
 
   # Sobe uma lista Elixir para a GPU via flawd, inferindo shape/type.
-  defp list_to_gnx(list) do
+  def list_to_gnx(list) do
     {rows, cols, type} = infer_list_shape_and_type(list)
     PolyHok.new_flawd_list(list, {rows, cols}, type)
   end
@@ -91,7 +87,7 @@ PolyHok.defmodule Ske do
   # Desce um gnx para lista Elixir via flawd, usando o type/shape do
   # próprio gnx (já conhecidos nesse ponto, pois foi criado por list_to_gnx
   # ou por um skeleton anterior operando sobre o mesmo tipo).
-  defp gnx_to_list(gnx) do
+  def gnx_to_list(gnx) do
     PolyHok.get_flawd_list(gnx)
   end
 

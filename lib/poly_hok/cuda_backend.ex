@@ -1,4 +1,7 @@
 defmodule PolyHok.CudaBackend do
+  # nowarn: raise proposital, código de matrex ainda incompleto
+  @dialyzer {:nowarn_function, gen_arg_matrix: 1}
+
   ########
   #Generating a new module in pure Elixir to substitute the PolyHok module in the Elixir program
   ################
@@ -48,14 +51,6 @@ defmodule PolyHok.CudaBackend do
 
     gen_new_definitions(t)
 end
-  defp include_module_name({:include, _, [{:__aliases__, _, [name]}]}), do: name
-
-  defp include_module_name(
-         {{:., _, [{:__aliases__, _, [:PolyHok]}, :include]}, _, [{:__aliases__, _, [name]}]}
-       ),
-       do: name
-
-  defp include_module_name(_definition), do: nil
   defp gen_new_definitions([{:defd , _, [header, _code] }| t]) do
   {fname, comp_info, para} = header
 
@@ -84,6 +79,15 @@ end
           gen_new_definitions(t)
       end
   end
+
+  defp include_module_name({:include, _, [{:__aliases__, _, [name]}]}), do: name
+
+  defp include_module_name(
+         {{:., _, [{:__aliases__, _, [:PolyHok]}, :include]}, _, [{:__aliases__, _, [name]}]}
+       ),
+       do: name
+
+  defp include_module_name(_definition), do: nil
 
   ############ Compile PolyHok Module
   def compile_module(module_name,body) do

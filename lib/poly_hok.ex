@@ -1,4 +1,9 @@
 defmodule PolyHok do
+  # nowarn: raises esperados / limites do Dialyzer com NIFs e macros
+  @dialyzer {:nowarn_function, load_nifs: 0}
+  @dialyzer {:nowarn_function, process_args_no_fun: 1}
+  @dialyzer {:nowarn_function, glist_binary_to_list: 2}
+
   @on_load :load_nifs
   def load_nifs do
       :erlang.load_nif("./priv/gpu_nifs", 0)
@@ -457,13 +462,13 @@ def null(a) do
   a
 end
 def new_gpu_array_nif(_l,_c,_type) do
-  raise "NIF new_gpu_array_nif/4 not implemented"
+  :erlang.nif_error(:nif_not_loaded)
 end
 def get_gpu_array_nif(_matrex,_l,_c,_type) do
-  raise "NIF get_gpu_array_nif/4 not implemented"
+  :erlang.nif_error(:nif_not_loaded)
 end
 def create_gpu_array_nx_nif(_matrex,_l,_c,_type) do
-  raise "NIF create_gpu_array_nx_nif/4 not implemented"
+  :erlang.nif_error(:nif_not_loaded)
 end
 
 
@@ -522,16 +527,16 @@ def get_gnx_({:nx, type, shape, name , ref}) do
 end
 
 def new_gpu_nx_nif(_l,_c,_type) do
-  raise "NIF get_nx_nif/4 not implemented"
+  :erlang.nif_error(:nif_not_loaded)
 end
 def get_nx_nif(_matrex,_l,_c,_type) do
-  raise "NIF get_nx_nif/4 not implemented"
+  :erlang.nif_error(:nif_not_loaded)
 end
 def create_nx_ref_nif(_matrex,_l,_c,_type) do
-  raise "NIF create_nx_ref_nif/4 not implemented"
+  :erlang.nif_error(:nif_not_loaded)
 end
   def create_ref_nif(_matrex) do
-    raise "NIF create_ref_nif/1 not implemented"
+    :erlang.nif_error(:nif_not_loaded)
 end
 
 
@@ -542,10 +547,10 @@ end
 ####################
 
 def new_pinned_nif(_list,_length) do
-  raise "NIF new_pinned_nif/1 not implemented"
+  :erlang.nif_error(:nif_not_loaded)
 end
 def new_gmatrex_pinned_nif(_array) do
-  raise "NIF new_gmatrex_pinned_nif/1 not implemented"
+  :erlang.nif_error(:nif_not_loaded)
 end
 def new_pinned(list) do
   size = length(list)
@@ -580,10 +585,10 @@ def new_gmatrex(r,c) do
 def gmatrex_size({_r,{l,size}}), do: {l,size}
 
 def new_ref_nif(_matrex) do
-  raise "NIF new_ref_nif/1 not implemented"
+  :erlang.nif_error(:nif_not_loaded)
 end
 def synchronize_nif() do
-  raise "NIF new_ref_nif/1 not implemented"
+  :erlang.nif_error(:nif_not_loaded)
 end
 def synchronize() do
   synchronize_nif()
@@ -593,7 +598,7 @@ ref=new_ref_nif(size)
 {ref, {1,size}}
 end
 def get_matrex_nif(_ref,_rows,_cols) do
-raise "NIF get_matrex_nif/1 not implemented"
+  :erlang.nif_error(:nif_not_loaded)
 end
 def get_gmatrex({ref,{rows,cols}}) do
   %Matrex{data: get_matrex_nif(ref,rows,cols)}
@@ -604,10 +609,10 @@ def get_gmatrex({:nx, type, shape, name , ref}) do
 end
 
 def load_kernel_nif(_module,_fun) do
-  raise "NIF load_kernel_nif/2 not implemented"
+  :erlang.nif_error(:nif_not_loaded)
 end
 def load_fun_nif(_module,_fun) do
-  raise "NIF load_fun_nif/2 not implemented"
+  :erlang.nif_error(:nif_not_loaded)
 end
 
 ############################################################## Loading types and asts from files
@@ -947,11 +952,11 @@ def spawn_st(_k,_t,_b,_l) do
   raise "First argument of spawn must be a function.."
 end
 def spawn_nif(_k,_t,_b,_l) do
-  raise "NIF spawn_nif/1 not implemented"
+  :erlang.nif_error(:nif_not_loaded)
 end
 
 def jit_compile_and_launch_nif(_n,_k,_t,_b,_size,_types,_l) do
-  raise "NIF jit_compile_and_launch_nif/7 not implemented"
+  :erlang.nif_error(:nif_not_loaded)
 end
 
 
@@ -1049,10 +1054,10 @@ end
 
   # ---- NIF stubs (substituídos automaticamente quando o .so é carregado) ----
   def new_flawd_list_nif(_list, _rows, _cols, _type),
-    do: raise("NIF new_flawd_list_nif/4 não carregado — rode `make` primeiro")
+    do: :erlang.nif_error(:nif_not_loaded)
 
   def get_flawd_list_nif(_ref, _n, _type),
-    do: raise("NIF get_flawd_list_nif/3 não carregado — rode `make` primeiro")
+    do: :erlang.nif_error(:nif_not_loaded)
 
   #######################################
   ##  flawd_ref — Lista Persistente na GPU

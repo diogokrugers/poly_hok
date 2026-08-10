@@ -12,7 +12,8 @@ lista = Enum.to_list(1..20)
 
 resultado_lista =
   Fusion.with_fusion(
-    Ske.map(lista, PolyHok.phok fn x -> x + 1 end)
+    lista
+    |> Ske.map(PolyHok.phok fn x -> x + 1 end)
     |> Ske.map(PolyHok.phok fn y -> y * 2 end)
   )
 
