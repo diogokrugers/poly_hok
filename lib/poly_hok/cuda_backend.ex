@@ -4,7 +4,7 @@ defmodule PolyHok.CudaBackend do
   ################
   def gen_new_module(header,body) do
     new_body =  case body do
-          {:__block__, [], definitions} ->  gen_new_definitions(definitions)
+          {:__block__, _, definitions} ->  gen_new_definitions(definitions)
           _   -> gen_new_definitions([body])
     end
 
@@ -48,6 +48,14 @@ defmodule PolyHok.CudaBackend do
 
     gen_new_definitions(t)
 end
+  defp include_module_name({:include, _, [{:__aliases__, _, [name]}]}), do: name
+
+  defp include_module_name(
+         {{:., _, [{:__aliases__, _, [:PolyHok]}, :include]}, _, [{:__aliases__, _, [name]}]}
+       ),
+       do: name
+
+  defp include_module_name(_definition), do: nil
   defp gen_new_definitions([{:defd , _, [header, _code] }| t]) do
   {fname, comp_info, para} = header
 
@@ -68,7 +76,13 @@ end
   end
   defp gen_new_definitions([h | t]) do
       #IO.inspect h
-      [h | gen_new_definitions(t)]
+      case include_module_name(h) do
+        nil ->
+          [h | gen_new_definitions(t)]
+
+        _name ->
+          gen_new_definitions(t)
+      end
   end
 
   ############ Compile PolyHok Module
@@ -79,7 +93,7 @@ end
     Process.register(pid, :types_ast_server)
 
     code = case body do
-        {:__block__, [], definitions} ->  compile_definitions(module_name,definitions)
+        {:__block__, _, definitions} ->  compile_definitions(module_name,definitions)
         _   -> compile_definitions(module_name,[body])
     end
 
@@ -152,7 +166,19 @@ end
                                               |> Enum.join("\n")
                                             rest_code = compile_definitions(module_name,t)
                                             code <> rest_code
-          _               -> compile_definitions(module_name,t)
+          _               ->
+                            case include_module_name(h) do
+                              nil ->
+                                compile_definitions(module_name,t)
+
+                              name ->
+                                code = File.read!("c_src/Elixir.#{name}.cu")
+                                  |>  String.split("\n")
+                                  |>  Enum.drop(1)
+                                  |> Enum.join("\n")
+                                rest_code = compile_definitions(module_name,t)
+                                code <> rest_code
+                            end
 
 
         end
@@ -467,7 +493,7 @@ def add_return(body) do
             _ ->  if is_exp?(exp) do
                     {:do, {:return,[],[exp]}}
                   else
-                    {:do, exp}
+                    {:do, check_return(exp)}
                   end
           end
       {_,_,_} ->  if (is_exp?(body)) do
@@ -482,8 +508,8 @@ end
 defp check_return([com]) do
   case com do
         {:return,_,_} -> [com]
-        {:if, info, [ exp,[do: block]]} -> {:if, info, [ exp,[do: check_return block]]}
-        {:if, info, [ exp,[do: block, else: belse ]]} -> {:if, info, [ exp,[do: check_return(block), else: check_return(belse) ]]}
+        {:if, info, [ exp,[do: block]]} -> [{:if, info, [ exp,[do: check_return block]]}]
+        {:if, info, [ exp,[do: block, else: belse ]]} -> [{:if, info, [ exp,[do: check_return(block), else: check_return(belse) ]]}]
             _ -> if is_exp?(com) do
                     [{:return,[],[com]}]
                 else
@@ -495,8 +521,21 @@ end
 defp check_return([h|t]) do
   [h|check_return t]
 end
+defp check_return(com) do
+  case com do
+        {:return,_,_} -> com
+        {:if, info, [ exp,[do: block]]} -> {:if, info, [ exp,[do: check_return block]]}
+        {:if, info, [ exp,[do: block, else: belse ]]} -> {:if, info, [ exp,[do: check_return(block), else: check_return(belse) ]]}
+            _ -> if is_exp?(com) do
+                    {:return,[],[com]}
+                else
+                  com
+                end
+  end
+end
 defp is_exp?(exp) do
   case exp do
+    {:=,_,_} -> false
     {{:., _info, [Access, :get]}, _, [_arg1,_arg2]} -> true
     {{:., _, [{_struct, _, nil}, _field]},_,[]} -> true
     {{:., _, [{:__aliases__, _, [_struct]}, _field]}, _, []} -> true
@@ -516,6 +555,11 @@ defp is_exp?(exp) do
 end
 
 #############################
+
+defp normalize_function_name({:., _, [_module_ast, fun_name]}) when is_atom(fun_name), do: fun_name
+defp normalize_function_name(fun_name) when is_atom(fun_name), do: fun_name
+defp normalize_function_name(fun_name), do: fun_name
+
 def check_fun(fun) do
   send(:types_server,{:check_fun, fun, self()})
   receive do
@@ -666,9 +710,10 @@ end
           |> Enum.map(&gen_exp/1)
           |> Enum.join(", ")
 
-          nfun = check_fun(fun)
+          fun_name = normalize_function_name(fun)
+          nfun = check_fun(fun_name)
           if nfun == nil do
-            "#{fun}(#{nargs});"
+            "#{fun_name}(#{nargs});"
           else
             "#{nfun}(#{nargs});"
           end
@@ -707,9 +752,10 @@ end
           |> Enum.map(&gen_exp/1)
           |> Enum.join(", ")
 
-          nfun = check_fun(fun)
+          fun_name = normalize_function_name(fun)
+          nfun = check_fun(fun_name)
           if nfun == nil do
-            "#{fun}(#{nargs})"
+            "#{fun_name}(#{nargs})"
           else
             "#{nfun}(#{nargs})"
           end

@@ -272,6 +272,12 @@ end
 ######            Types are used to type check at runtime a kernel call
 ######            ASTs are used to recompile a kernel at runtime substituting the names of the formal parameters of a function for
 ######         the actual parameters
+######
+######  It also serves as a cache for Fusion (Fusion.with_fusion): fused
+######  anonymous functions are memoized by a structural key (see
+######  Fusion.normalize_fusion_key/1) in ast_map[:fusion], so that the
+######  same skeleton pipeline is only compiled to a fused kernel once,
+######  regardless of how many times it is expanded at compile time.
 ############################
 def module_server(types_map,ast_map) do
    receive do
@@ -289,6 +295,15 @@ def module_server(types_map,ast_map) do
                              nil -> module_server(types_map,Map.put(ast_map,:include,[inc]))
                              l -> module_server(types_map,Map.put(ast_map,:include,[inc|l]))
                             end
+
+     {:get_fusion, key, pid} ->
+       fusion_map = Map.get(ast_map, :fusion, %{})
+       send(pid, {:fusion, Map.get(fusion_map, key)})
+       module_server(types_map, ast_map)
+
+     {:put_fusion, key, value} ->
+       fusion_map = Map.get(ast_map, :fusion, %{})
+       module_server(types_map, Map.put(ast_map, :fusion, Map.put(fusion_map, key, value)))
 
      {:kill} ->
            :ok
