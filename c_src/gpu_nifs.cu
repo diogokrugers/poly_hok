@@ -117,6 +117,11 @@ ErlNifResourceType *ARRAY_TYPE;
 ErlNifResourceType *PINNED_ARRAY;
 ErlNifResourceType *FLAWD_ARRAY_TYPE;
 
+/* Precisa estar visível aqui para que jit_compile_and_launch_nif possa 
+ * lançar o kernel na mesma stream usada pelas transferências H2D/D2H do 
+ * flawd (ver comentário "STREAM DO KERNEL" dentro de jit_compile_and_launch_nif). */
+static cudaStream_t flawd_get_stream(void);
+
 void
 dev_array_destructor(ErlNifEnv *env, void *res) {
   CUdeviceptr *dev_array = (CUdeviceptr*) res;
@@ -346,6 +351,9 @@ static ERL_NIF_TERM jit_compile_and_launch_nif(ErlNifEnv *env, int argc, const E
   int floats_ptr=0;
   int doubles_ptr=0;
   int ints_ptr=0;
+  /* Marcada quando algum argumento tint/tfloat/tdouble vier de um
+   * resource FLAWD_ARRAY_TYPE (ver "STREAM DO KERNEL" mais abaixo). */
+  int uses_flawd_array = 0;
   // printf("%s\n",code);
    //printf("Args: %d %d %d %d %d %d\n",b1,b2,b3,t1,t2,t3);
  
@@ -456,16 +464,20 @@ static ERL_NIF_TERM jit_compile_and_launch_nif(ErlNifEnv *env, int argc, const E
     {
   
       CUdeviceptr *array_res;
-      if (!enif_get_resource(env, head_args, ARRAY_TYPE, (void **)&array_res))
+      if (!enif_get_resource(env, head_args, ARRAY_TYPE, (void **)&array_res)) {
         enif_get_resource(env, head_args, FLAWD_ARRAY_TYPE, (void **)&array_res);
+        uses_flawd_array = 1;
+      }
       arrays[arrays_ptr] = *array_res;
       args[i] = (void*)  &arrays[arrays_ptr];
       arrays_ptr++;
     } else if (strcmp(type_name, "tfloat") == 0)
     {
       CUdeviceptr *array_res;
-      if (!enif_get_resource(env, head_args, ARRAY_TYPE, (void **)&array_res))
+      if (!enif_get_resource(env, head_args, ARRAY_TYPE, (void **)&array_res)) {
         enif_get_resource(env, head_args, FLAWD_ARRAY_TYPE, (void **)&array_res);
+        uses_flawd_array = 1;
+      }
       arrays[arrays_ptr] = *array_res;
       args[i] = (void*)  &arrays[arrays_ptr];
       arrays_ptr++;
@@ -474,8 +486,10 @@ static ERL_NIF_TERM jit_compile_and_launch_nif(ErlNifEnv *env, int argc, const E
     {
 
       CUdeviceptr *array_res;
-      if (!enif_get_resource(env, head_args, ARRAY_TYPE, (void **)&array_res))
+      if (!enif_get_resource(env, head_args, ARRAY_TYPE, (void **)&array_res)) {
         enif_get_resource(env, head_args, FLAWD_ARRAY_TYPE, (void **)&array_res);
+        uses_flawd_array = 1;
+      }
       arrays[arrays_ptr] = *array_res;
       //printf("pointer %p\n",arrays[arrays_ptr]);
       args[i] = (void*)  &arrays[arrays_ptr];
@@ -505,9 +519,19 @@ static ERL_NIF_TERM jit_compile_and_launch_nif(ErlNifEnv *env, int argc, const E
 
     init_cuda(env);
 
+  /* ----------------------------------------------------------------
+   * STREAM DO KERNEL
+   * Para chamadas que não envolvem flawd, uses_flawd_array permanece 0
+   * e o kernel continua sendo lançado na stream default (0), tal qual
+   * como era antes — nenhum outro caminho (tipo o gnx) é afetado.
+   * ---------------------------------------------------------------- */
+  CUstream launch_stream = uses_flawd_array
+                              ? (CUstream) flawd_get_stream()
+                              : (CUstream) 0;
+
   err = cuLaunchKernel(function, b1, b2, b3,  // Nx1x1 blocks
                                     t1, t2, t3,            // 1x1x1 threads
-                                    0, 0, args, 0) ;
+                                    0, launch_stream, args, 0) ;
  // printf("after kernel launch\n");
   if (err != CUDA_SUCCESS) fail_cuda(env,err,"cuLaunchKernel jit compile");
    

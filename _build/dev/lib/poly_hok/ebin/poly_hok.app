@@ -1,1 +1,0 @@
-{application,poly_hok,[{modules,['Elixir.Fusion','Elixir.Fusion.AstCall','Elixir.JIT','Elixir.PolyHok','Elixir.PolyHok.CudaBackend','Elixir.PolyHok.TypeInference','Elixir.Ske']},{optional_applications,[]},{applications,[kernel,stdlib,elixir,logger,matrex,nx]},{description,"poly_hok"},{registered,[]},{vsn,"0.1.0"}]}.
