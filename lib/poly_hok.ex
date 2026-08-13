@@ -1052,11 +1052,24 @@ end
     get_flawd_list_nif(ref, n, type_str)
   end
 
+  # Libera o slot do device pool ocupado por um array flawd sem descer os
+  # dados para uma lista Elixir. Usada para o array de ENTRADA de um
+  # skeleton (Ske.map/map2/map3/map4/reduce), o array de SAÍDA é liberado
+  # normalmente via get_flawd_list, mas o de entrada nunca passa por ali,
+  # e sem esta chamada seu slot no device pool ficaria preso indefinidamente.
+  # Chamar sobre um gnx que não veio do flawd (:nx normal) é um no-op seguro.
+  def release_flawd_list({:nx, _type, _shape, _names, ref}) do
+    release_flawd_list_nif(ref)
+  end
+
   # ---- NIF stubs (substituídos automaticamente quando o .so é carregado) ----
   def new_flawd_list_nif(_list, _rows, _cols, _type),
     do: :erlang.nif_error(:nif_not_loaded)
 
   def get_flawd_list_nif(_ref, _n, _type),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def release_flawd_list_nif(_ref),
     do: :erlang.nif_error(:nif_not_loaded)
 
   #######################################

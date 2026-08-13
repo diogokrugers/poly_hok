@@ -117,9 +117,11 @@ ErlNifResourceType *ARRAY_TYPE;
 ErlNifResourceType *PINNED_ARRAY;
 ErlNifResourceType *FLAWD_ARRAY_TYPE;
 
-/* Precisa estar visível aqui para que jit_compile_and_launch_nif possa 
- * lançar o kernel na mesma stream usada pelas transferências H2D/D2H do 
- * flawd (ver comentário "STREAM DO KERNEL" dentro de jit_compile_and_launch_nif). */
+/* Forward declaration: definida junto com o resto da infraestrutura de
+ * stream do flawd, mais abaixo no arquivo. Precisa estar visível aqui
+ * para que jit_compile_and_launch_nif possa lançar o kernel na mesma
+ * stream usada pelas transferências H2D/D2H do flawd (ver comentário
+ * "STREAM DO KERNEL" dentro de jit_compile_and_launch_nif). */
 static cudaStream_t flawd_get_stream(void);
 
 void
@@ -521,9 +523,20 @@ static ERL_NIF_TERM jit_compile_and_launch_nif(ErlNifEnv *env, int argc, const E
 
   /* ----------------------------------------------------------------
    * STREAM DO KERNEL
-   * Para chamadas que não envolvem flawd, uses_flawd_array permanece 0
-   * e o kernel continua sendo lançado na stream default (0), tal qual
-   * como era antes — nenhum outro caminho (tipo o gnx) é afetado.
+   *
+   * Quando algum argumento tint/tfloat/tdouble veio de um array flawd
+   * (uses_flawd_array == 1), lança o kernel na MESMA stream usada por
+   * new_flawd_list_nif/get_flawd_list_nif (g_flawd_stream) em vez da
+   * stream default (0). Dentro de uma única stream CUDA, operações
+   * são sempre executadas na ordem em que foram enfileiradas — então
+   * H2D -> kernel -> D2H ficam ordenados pela própria stream, sem
+   * depender de um cudaEvent/cudaStreamWaitEvent para costurar a
+   * ordem entre streams diferentes.
+   *
+   * Para chamadas que não envolvem flawd, uses_flawd_array permanece
+   * 0 e o kernel continua sendo lançado na stream default (0), exatamente
+   * como antes desta mudança — nenhum outro caminho (gnx puro, glist,
+   * etc.) é afetado.
    * ---------------------------------------------------------------- */
   CUstream launch_stream = uses_flawd_array
                               ? (CUstream) flawd_get_stream()
@@ -1797,88 +1810,176 @@ static cudaStream_t flawd_get_stream(void) {
  * cada. Chamadas por operação (new + get) somavam ~5-6ms de piso
  * fixo, dominando o benchmark para todos os tamanhos pequenos.
  *
- * Solução: dois buffers pinned persistentes (H2D e D2H), alocados
- * uma única vez e reutilizados via acquire/release com mutex.
- * Se uma requisição precisar de mais espaço que o buffer atual,
- * o buffer cresce (cudaFreeHost + cudaMallocHost) — "grow-only".
+ * Solução: um pool de buffers pinned persistentes por direção (H2D
+ * e D2H), cada buffer alocado sob demanda e reaproveitado via
+ * acquire/release, "grow-only" por slot (um slot que já tem
+ * capacidade suficiente é reaproveitado sem nova alocação).
  *
- * Modelo de concorrência: serialize por pool (segunda chamada
- * concorrente espera a primeira liberar). Para workloads
- * paralelos intensos um pool de N slots seria melhor, mas este
- * modelo já elimina o overhead para o caso sequencial (benchmark).
+ * Múltiplos slots (em vez de um único buffer travado por mutex de
+ * exclusão) são necessários porque Ske.map2/map3/map4/map2Reduce/
+ * map4Reduce sobem MAIS DE UM array flawd simultaneamente antes de
+ * qualquer um deles ser liberado (o release só acontece dentro de
+ * get_flawd_list_nif, no fim do pipeline) — um único slot causava
+ * deadlock: a segunda chamada de new_flawd_list_nif ficava travada
+ * esperando um mutex que só seria liberado depois que o pipeline
+ * inteiro (que nunca chegava a rodar) terminasse.
  * --------------------------------------------------------------- */
+#define FLAWD_POOL_SLOTS 8
+
 typedef struct {
-    void            *buf;
-    size_t           capacity;
-    pthread_mutex_t  lock;
+    void  *buf;
+    size_t capacity;
+    int    in_use;
+} PinnedSlot;
+
+typedef struct {
+    PinnedSlot      slots[FLAWD_POOL_SLOTS];
+    pthread_mutex_t lock;
 } PinnedPool;
 
 /* Pool H2D: usado em new_flawd_list_nif */
-static PinnedPool g_flawd_h2d = {NULL, 0, PTHREAD_MUTEX_INITIALIZER};
+static PinnedPool g_flawd_h2d = { .lock = PTHREAD_MUTEX_INITIALIZER };
 /* Pool D2H: usado em get_flawd_list_nif */
-static PinnedPool g_flawd_d2h = {NULL, 0, PTHREAD_MUTEX_INITIALIZER};
+static PinnedPool g_flawd_d2h = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
-/* Adquire o buffer do pool, crescendo se necessário.
- * Retorna NULL em caso de falha de alocação.
- * IMPORTANTE: o chamador DEVE invocar pinned_pool_release() após o uso. */
+/* Adquire um slot livre do pool com capacidade >= needed, crescendo-o
+ * (ou alocando-o pela primeira vez) se necessário. Retorna NULL se
+ * todos os FLAWD_POOL_SLOTS estiverem em uso simultaneamente (ver
+ * FLAWD_POOL_SLOTS acima) ou se a alocação falhar.
+ * IMPORTANTE: o chamador DEVE invocar pinned_pool_release() com o
+ * MESMO ponteiro retornado aqui, após o uso. */
 static void* pinned_pool_acquire(PinnedPool *pool, size_t needed) {
     pthread_mutex_lock(&pool->lock);
-    if (pool->capacity < needed) {
-        if (pool->buf != NULL) {
-            cudaFreeHost(pool->buf);
-            pool->buf      = NULL;
-            pool->capacity = 0;
+
+    int free_idx = -1;
+    for (int i = 0; i < FLAWD_POOL_SLOTS; i++) {
+        if (!pool->slots[i].in_use) {
+            /* prefere um slot livre que já tenha capacidade suficiente */
+            if (pool->slots[i].capacity >= needed) {
+                pool->slots[i].in_use = 1;
+                pthread_mutex_unlock(&pool->lock);
+                return pool->slots[i].buf;
+            }
+            if (free_idx == -1) free_idx = i;
         }
-        cudaError_t e = cudaMallocHost(&pool->buf, needed);
-        if (e != cudaSuccess) {
-            pthread_mutex_unlock(&pool->lock);
-            return NULL;   /* caller verifica e reporta erro */
-        }
-        pool->capacity = needed;
     }
-    return pool->buf;    /* mutex permanece travado até release */
+
+    if (free_idx == -1) {
+        /* todos os slots estão em uso ao mesmo tempo */
+        pthread_mutex_unlock(&pool->lock);
+        return NULL;
+    }
+
+    PinnedSlot *slot = &pool->slots[free_idx];
+    if (slot->buf != NULL) {
+        cudaFreeHost(slot->buf);
+        slot->buf      = NULL;
+        slot->capacity = 0;
+    }
+    cudaError_t e = cudaMallocHost(&slot->buf, needed);
+    if (e != cudaSuccess) {
+        pthread_mutex_unlock(&pool->lock);
+        return NULL;   /* caller verifica e reporta erro */
+    }
+    slot->capacity = needed;
+    slot->in_use   = 1;
+
+    void *result = slot->buf;
+    pthread_mutex_unlock(&pool->lock);
+    return result;
 }
 
-/* Libera o pool para o próximo caller. */
-static void pinned_pool_release(PinnedPool *pool) {
+/* Libera o slot correspondente a `ptr` para reutilização futura. */
+static void pinned_pool_release(PinnedPool *pool, void *ptr) {
+    pthread_mutex_lock(&pool->lock);
+    for (int i = 0; i < FLAWD_POOL_SLOTS; i++) {
+        if (pool->slots[i].buf == ptr) {
+            pool->slots[i].in_use = 0;
+            break;
+        }
+    }
     pthread_mutex_unlock(&pool->lock);
 }
 
 typedef struct {
-    CUdeviceptr     ptr;
-    size_t          capacity;
+    CUdeviceptr ptr;
+    size_t      capacity;
+    int         in_use;
+} DeviceSlot;
+
+typedef struct {
+    DeviceSlot      slots[FLAWD_POOL_SLOTS];
     pthread_mutex_t lock;
 } DevicePool;
 
-static DevicePool g_flawd_dev = {0, 0, PTHREAD_MUTEX_INITIALIZER};
+static DevicePool g_flawd_dev = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
+/* Mesma lógica de pinned_pool_acquire, para memória device. */
 static CUdeviceptr device_pool_acquire(DevicePool *pool, size_t needed) {
     pthread_mutex_lock(&pool->lock);
-    if (pool->capacity < needed) {
-        if (pool->ptr != 0) {
-            cuMemFree(pool->ptr);
-            pool->ptr      = 0;
-            pool->capacity = 0;
+
+    int free_idx = -1;
+    for (int i = 0; i < FLAWD_POOL_SLOTS; i++) {
+        if (!pool->slots[i].in_use) {
+            if (pool->slots[i].capacity >= needed) {
+                pool->slots[i].in_use = 1;
+                pthread_mutex_unlock(&pool->lock);
+                return pool->slots[i].ptr;
+            }
+            if (free_idx == -1) free_idx = i;
         }
-        CUresult e = cuMemAlloc(&pool->ptr, needed);
-        if (e != CUDA_SUCCESS) {
-            pthread_mutex_unlock(&pool->lock);
-            return 0;
-        }
-        pool->capacity = needed;
     }
-    return pool->ptr;
+
+    if (free_idx == -1) {
+        pthread_mutex_unlock(&pool->lock);
+        return 0;
+    }
+
+    DeviceSlot *slot = &pool->slots[free_idx];
+    if (slot->ptr != 0) {
+        cuMemFree(slot->ptr);
+        slot->ptr      = 0;
+        slot->capacity = 0;
+    }
+    CUresult e = cuMemAlloc(&slot->ptr, needed);
+    if (e != CUDA_SUCCESS) {
+        pthread_mutex_unlock(&pool->lock);
+        return 0;
+    }
+    slot->capacity = needed;
+    slot->in_use   = 1;
+
+    CUdeviceptr result = slot->ptr;
+    pthread_mutex_unlock(&pool->lock);
+    return result;
 }
 
-static void device_pool_release(DevicePool *pool) {
+/* Libera o slot correspondente a `ptr` para reutilização futura. */
+static void device_pool_release(DevicePool *pool, CUdeviceptr ptr) {
+    pthread_mutex_lock(&pool->lock);
+    for (int i = 0; i < FLAWD_POOL_SLOTS; i++) {
+        if (pool->slots[i].ptr == ptr) {
+            pool->slots[i].in_use = 0;
+            break;
+        }
+    }
     pthread_mutex_unlock(&pool->lock);
 }
+
+/* userData do callback carrega tanto o pool quanto o ponteiro do slot
+ * a liberar (antes bastava o pool, pois havia um único slot possível). */
+typedef struct {
+    PinnedPool *pool;
+    void       *ptr;
+} ReleaseH2DCallbackData;
 
 static void CUDART_CB release_h2d_pool_callback(cudaStream_t stream,
                                                   cudaError_t  status,
                                                   void        *userData) {
     (void)stream; (void)status;
-    pinned_pool_release((PinnedPool *)userData);
+    ReleaseH2DCallbackData *data = (ReleaseH2DCallbackData *)userData;
+    pinned_pool_release(data->pool, data->ptr);
+    free(data);
 }
 
 /* ---------------------------------------------------------------
@@ -1917,7 +2018,7 @@ static ERL_NIF_TERM new_flawd_list_nif(ErlNifEnv *env, int argc,
     if (h_buf == NULL) {
         return enif_raise_exception(env,
             enif_make_string(env,
-                "new_flawd_list_nif: pinned_pool_acquire falhou (cudaMallocHost)",
+                "new_flawd_list_nif: pinned_pool_acquire falhou (cudaMallocHost, pool cheio ou sem memoria)",
                 ERL_NIF_LATIN1));
     }
 
@@ -1984,10 +2085,10 @@ static ERL_NIF_TERM new_flawd_list_nif(ErlNifEnv *env, int argc,
     init_cuda(env);
     CUdeviceptr dev_array = device_pool_acquire(&g_flawd_dev, data_size);
     if (dev_array == 0) {
-        pinned_pool_release(&g_flawd_h2d);   /* H2D pool: libera manualmente aqui */
+        pinned_pool_release(&g_flawd_h2d, h_buf);   /* H2D pool: libera manualmente aqui */
         return enif_raise_exception(env,
             enif_make_string(env,
-                "new_flawd_list_nif: device_pool_acquire falhou (cuMemAlloc)",
+                "new_flawd_list_nif: device_pool_acquire falhou (cuMemAlloc, pool cheio ou sem memoria)",
                 ERL_NIF_LATIN1));
     }
 
@@ -1996,8 +2097,8 @@ static ERL_NIF_TERM new_flawd_list_nif(ErlNifEnv *env, int argc,
     cudaError_t cerr = cudaMemcpyAsync((void *)dev_array, h_buf, data_size,
                                         cudaMemcpyHostToDevice, fstream);
     if (cerr != cudaSuccess) {
-        device_pool_release(&g_flawd_dev);
-        pinned_pool_release(&g_flawd_h2d);
+        device_pool_release(&g_flawd_dev, dev_array);
+        pinned_pool_release(&g_flawd_h2d, h_buf);
         char msg[256];
         snprintf(msg, sizeof(msg),
                  "new_flawd_list_nif: cudaMemcpyAsync H2D: %s",
@@ -2006,7 +2107,14 @@ static ERL_NIF_TERM new_flawd_list_nif(ErlNifEnv *env, int argc,
                     enif_make_string(env, msg, ERL_NIF_LATIN1));
     }
 
-    cudaStreamAddCallback(fstream, release_h2d_pool_callback, &g_flawd_h2d, 0);
+    /* userData precisa sobreviver até o callback rodar (assíncrono, após
+     * esta função já ter retornado) — alocado no heap, liberado pelo
+     * próprio callback (ver release_h2d_pool_callback). */
+    ReleaseH2DCallbackData *cb_data =
+        (ReleaseH2DCallbackData *)malloc(sizeof(ReleaseH2DCallbackData));
+    cb_data->pool = &g_flawd_h2d;
+    cb_data->ptr  = h_buf;
+    cudaStreamAddCallback(fstream, release_h2d_pool_callback, cb_data, 0);
 
     cudaEvent_t h2d_done;
     cudaEventCreateWithFlags(&h2d_done, cudaEventDisableTiming);
@@ -2024,6 +2132,31 @@ static ERL_NIF_TERM new_flawd_list_nif(ErlNifEnv *env, int argc,
 }
 
 /* ---------------------------------------------------------------
+ * release_flawd_list_nif: libera o slot do DevicePool de um array
+ * FLAWD_ARRAY_TYPE sem descer os dados para a lista Elixir.
+ *
+ * Necessária porque Ske.map/map2/map3/map4/reduce (ver ske.ex) sobem o(s)
+ * array(s) de ENTRADA via new_flawd_list, mas o resultado do kernel é um
+ * array de SAÍDA separado (criado via PolyHok.new_gnx, não vem do device
+ * pool). get_flawd_list só é chamado sobre o array de saída — o slot do
+ * array de entrada nunca seria liberado sem esta função, vazando um slot
+ * do pool a cada chamada até os FLAWD_POOL_SLOTS se esgotarem (erro
+ * "device_pool_acquire falhou... pool cheio").
+ *
+ * Chamar sobre um recurso ARRAY_TYPE (gnx normal, não veio do pool) é um
+ * no-op seguro — não há slot para liberar.
+ * --------------------------------------------------------------- */
+static ERL_NIF_TERM release_flawd_list_nif(ErlNifEnv *env, int argc,
+                                            const ERL_NIF_TERM argv[]) {
+    CUdeviceptr *array_res;
+    if (enif_get_resource(env, argv[0], FLAWD_ARRAY_TYPE, (void **)&array_res)) {
+        device_pool_release(&g_flawd_dev, *array_res);
+    }
+    /* ARRAY_TYPE ou tipo desconhecido: nada a fazer, não é erro */
+    return enif_make_atom(env, "ok");
+}
+
+/* ---------------------------------------------------------------
  * get_flawd_list_nif(ref, n, type_charlist)
  *
  * D2H via pinned memory assíncrona.
@@ -2031,11 +2164,16 @@ static ERL_NIF_TERM new_flawd_list_nif(ErlNifEnv *env, int argc,
  * --------------------------------------------------------------- */
 static ERL_NIF_TERM get_flawd_list_nif(ErlNifEnv *env, int argc,
                                         const ERL_NIF_TERM argv[]) {
-    /* Aceita tanto ARRAY_TYPE quanto FLAWD_ARRAY_TYPE */
+    /* Aceita tanto ARRAY_TYPE quanto FLAWD_ARRAY_TYPE. Só arrays
+     * FLAWD_ARRAY_TYPE vieram do device pool (g_flawd_dev) — só esses
+     * devem ter seu slot liberado ao final. */
     CUdeviceptr *array_res;
-    if (!enif_get_resource(env, argv[0], FLAWD_ARRAY_TYPE, (void **)&array_res) &&
-        !enif_get_resource(env, argv[0], ARRAY_TYPE,       (void **)&array_res))
-        return enif_make_badarg(env);
+    int from_flawd_pool = 1;
+    if (!enif_get_resource(env, argv[0], FLAWD_ARRAY_TYPE, (void **)&array_res)) {
+        from_flawd_pool = 0;
+        if (!enif_get_resource(env, argv[0], ARRAY_TYPE, (void **)&array_res))
+            return enif_make_badarg(env);
+    }
 
     int n;
     if (!enif_get_int(env, argv[1], &n)) return enif_make_badarg(env);
@@ -2057,10 +2195,10 @@ static ERL_NIF_TERM get_flawd_list_nif(ErlNifEnv *env, int argc,
     /* ---- Adquire buffer pinned D2H do pool ---- */
     void *h_buf = pinned_pool_acquire(&g_flawd_d2h, data_size);
     if (h_buf == NULL) {
-        device_pool_release(&g_flawd_dev);   /* libera device pool em caso de erro */
+        if (from_flawd_pool) device_pool_release(&g_flawd_dev, *array_res);
         return enif_raise_exception(env,
             enif_make_string(env,
-                "get_flawd_list_nif: pinned_pool_acquire falhou (cudaMallocHost)",
+                "get_flawd_list_nif: pinned_pool_acquire falhou (cudaMallocHost, pool cheio ou sem memoria)",
                 ERL_NIF_LATIN1));
     }
 
@@ -2068,8 +2206,8 @@ static ERL_NIF_TERM get_flawd_list_nif(ErlNifEnv *env, int argc,
     cudaError_t cerr = cudaMemcpyAsync(h_buf, (const void *)*array_res, data_size,
                                         cudaMemcpyDeviceToHost, fstream);
     if (cerr != cudaSuccess) {
-        pinned_pool_release(&g_flawd_d2h);
-        device_pool_release(&g_flawd_dev);
+        pinned_pool_release(&g_flawd_d2h, h_buf);
+        if (from_flawd_pool) device_pool_release(&g_flawd_dev, *array_res);
         char msg[256];
         snprintf(msg, sizeof(msg),
                  "get_flawd_list_nif: cudaMemcpyAsync D2H: %s",
@@ -2080,7 +2218,7 @@ static ERL_NIF_TERM get_flawd_list_nif(ErlNifEnv *env, int argc,
     /* Sync necessário: precisamos dos dados antes de construir a lista */
     cudaStreamSynchronize(fstream);
 
-    device_pool_release(&g_flawd_dev);
+    if (from_flawd_pool) device_pool_release(&g_flawd_dev, *array_res);
 
     /* Threshold para stack vs heap: 4096 termos * 8 bytes = 32KB — seguro */
 #define FLAWD_STACK_TERMS 4096
@@ -2093,7 +2231,8 @@ static ERL_NIF_TERM get_flawd_list_nif(ErlNifEnv *env, int argc,
     } else {
         terms = (ERL_NIF_TERM *)enif_alloc((size_t)n * sizeof(ERL_NIF_TERM));
         if (terms == NULL) {
-            pinned_pool_release(&g_flawd_d2h);
+            /* device pool já foi liberado logo acima — só falta o pinned D2H */
+            pinned_pool_release(&g_flawd_d2h, h_buf);
             return enif_raise_exception(env,
                 enif_make_string(env,
                     "get_flawd_list_nif: enif_alloc falhou para array de termos",
@@ -2122,7 +2261,7 @@ static ERL_NIF_TERM get_flawd_list_nif(ErlNifEnv *env, int argc,
 
     if (terms_heap) enif_free(terms);
 
-    pinned_pool_release(&g_flawd_d2h);
+    pinned_pool_release(&g_flawd_d2h, h_buf);
     return result;
 }
 
@@ -2146,6 +2285,7 @@ static ErlNifFunc nif_funcs[] = {
     /* dirty NIFs não bloqueiam schedulers limpos */
     {"new_flawd_list_nif",         4, new_flawd_list_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"get_flawd_list_nif",         3, get_flawd_list_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"release_flawd_list_nif",     1, release_flawd_list_nif, 0},
 };
 
 ERL_NIF_INIT(Elixir.PolyHok, nif_funcs, &load, NULL, NULL, NULL)

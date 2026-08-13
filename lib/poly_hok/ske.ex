@@ -91,15 +91,28 @@ PolyHok.defmodule Ske do
     PolyHok.get_flawd_list(gnx)
   end
 
+  # Desce `result_gnx` para lista Elixir e, em seguida, libera o(s)
+  # array(s) de ENTRADA (`input_gnxs`, um gnx ou lista de gnx) que
+  # list_to_gnx subiu para esta chamada.
+  def gnx_to_list_releasing(result_gnx, input_gnxs) do
+    result_list = gnx_to_list(result_gnx)
+
+    input_gnxs
+    |> List.wrap()
+    |> Enum.each(&PolyHok.release_flawd_list/1)
+
+    result_list
+  end
+
   #######################################
   ##  reduce / mapReduce / map2Reduce / map4Reduce
   #######################################
 
   def reduce(ref, initial, f) when is_list(ref) do
-    ref
-    |> list_to_gnx()
+    g1 = list_to_gnx(ref)
+    g1
     |> reduce(initial, f)
-    |> gnx_to_list()
+    |> gnx_to_list_releasing(g1)
   end
   def reduce(ref, initial, f) do
 
@@ -168,10 +181,10 @@ PolyHok.defmodule Ske do
   end
 
   def mapReduce(ref, initial, map_f, red_f) when is_list(ref) do
-    ref
-    |> list_to_gnx()
+    g1 = list_to_gnx(ref)
+    g1
     |> mapReduce(initial, map_f, red_f)
-    |> gnx_to_list()
+    |> gnx_to_list_releasing(g1)
   end
   def mapReduce(ref, initial, map_f, red_f) do
     shape = PolyHok.get_shape_gnx(ref)
@@ -278,7 +291,7 @@ PolyHok.defmodule Ske do
     g2 = list_to_gnx(t2)
 
     map2Reduce(g1, g2, initial, map_f, red_f)
-    |> gnx_to_list()
+    |> gnx_to_list_releasing([g1, g2])
   end
   def map2Reduce(t1, t2, initial, map_f, red_f) do
     shape1 = PolyHok.get_shape_gnx(t1)
@@ -395,7 +408,7 @@ PolyHok.defmodule Ske do
     g4 = list_to_gnx(t4)
 
     map4Reduce(g1, g2, g3, g4, initial, map_f, red_f)
-    |> gnx_to_list()
+    |> gnx_to_list_releasing([g1, g2, g3, g4])
   end
   def map4Reduce(t1, t2, t3, t4, initial, map_f, red_f) do
     shape1 = PolyHok.get_shape_gnx(t1)
@@ -552,10 +565,10 @@ end
     end
   end
   def map(input, f) when is_list(input) do
-    input
-    |> list_to_gnx()
+    g1 = list_to_gnx(input)
+    g1
     |> map(f)
-    |> gnx_to_list()
+    |> gnx_to_list_releasing(g1)
   end
   def map(input, f) do
     shape = PolyHok.get_shape(input)
@@ -586,7 +599,7 @@ end
     g2 = list_to_gnx(t2)
 
     map2(g1, g2, func)
-    |> gnx_to_list()
+    |> gnx_to_list_releasing([g1, g2])
   end
   def map2(t1,t2,func) do
 
@@ -622,7 +635,7 @@ end
     g3 = list_to_gnx(t3)
 
     map3(g1, g2, g3, func)
-    |> gnx_to_list()
+    |> gnx_to_list_releasing([g1, g2, g3])
   end
   def map3(t1, t2, t3, func) do
     shape1 = PolyHok.get_shape_gnx(t1)
@@ -679,7 +692,7 @@ end
     g4 = list_to_gnx(t4)
 
     map4(g1, g2, g3, g4, func)
-    |> gnx_to_list()
+    |> gnx_to_list_releasing([g1, g2, g3, g4])
   end
   def map4(t1, t2, t3, t4, func) do
     shape1 = PolyHok.get_shape_gnx(t1)

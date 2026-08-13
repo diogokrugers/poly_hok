@@ -341,6 +341,10 @@ defp process_definitions(module_name,[h|t],l) do
                 #IO.inspect code
                 send(:module_server,{:add_include,code})
                 process_definitions(module_name,t,l)
+        {{:., _, [{:__aliases__, _, [:PolyHok]}, :include]}, _, [{:__aliases__, _, [name]}]} ->
+                code = File.read!("c_src/Elixir.#{name}.cu")
+                send(:module_server,{:add_include,code})
+                process_definitions(module_name,t,l)
         _               -> process_definitions(module_name,t,l)
 
 
