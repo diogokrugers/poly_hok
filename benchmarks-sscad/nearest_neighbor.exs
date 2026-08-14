@@ -156,7 +156,6 @@ defmodule NearestNeighborBench do
   # ----------------------------------------------------------------
 
   defp bench(n) do
-    IO.write("nearest_neighbor n=#{n}... ")
 
     {lats, lngs} = gen_points(n)
     nx_lat = Nx.tensor([lats], type: @dtype)
@@ -169,7 +168,6 @@ defmodule NearestNeighborBench do
         fn -> lats |> Ske.map2(lngs, df) |> Ske.reduce(1.0e9, mf) end,
         @iterations
       )
-    IO.write "\ncheck #{n} flawd!"
     flawd_fusion =
       BenchHelpers.measure(
         fn ->
@@ -199,7 +197,6 @@ defmodule NearestNeighborBench do
         end,
         @iterations
       )
-    IO.write "\ncheck #{n} flawd fusion!"
 
     gnx =
       BenchHelpers.measure(
@@ -211,10 +208,8 @@ defmodule NearestNeighborBench do
         end,
         @iterations
       )
-    IO.write "\ncheck #{n} gnx!"
 
     cpu = BenchHelpers.measure(fn -> cpu_nn(lats, lngs) end, @iterations)
-    IO.write "\ncheck #{n} cpu!\n"
 
     IO.puts(
       "flawd=#{BenchHelpers.fmt_time(flawd)} " <>
