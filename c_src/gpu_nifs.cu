@@ -126,14 +126,16 @@ static cudaStream_t flawd_get_stream(void);
 
 void
 dev_array_destructor(ErlNifEnv *env, void *res) {
-  CUdeviceptr *dev_array = (CUdeviceptr*) res;
-  cuMemFree(*dev_array);
+  (void)env;
+  (void)res;
 }
 
 void
 dev_pinned_array_destructor(ErlNifEnv *env, void *res) {
-  float **dev_array = (float**) res;
-  cudaFreeHost(*dev_array);
+  /* Mesmo raciocínio de dev_array_destructor acima — não libera de fato,
+   * para evitar cudaFreeHost concorrente com outras chamadas CUDA. */
+  (void)env;
+  (void)res;
 }
 
 static void flawd_dev_array_destructor(ErlNifEnv *env, void *res) {
@@ -1871,11 +1873,17 @@ static void* pinned_pool_acquire(PinnedPool *pool, size_t needed) {
     }
 
     PinnedSlot *slot = &pool->slots[free_idx];
-    if (slot->buf != NULL) {
-        cudaFreeHost(slot->buf);
-        slot->buf      = NULL;
-        slot->capacity = 0;
-    }
+    /* IMPORTANTE: nunca chamamos cudaFreeHost aqui, mesmo que slot->buf já
+     * tenha um buffer menor. No driver CUDA do WSL2, uma chamada
+     * cudaFreeHost seguida rapidamente de cudaMallocHost (o padrão de
+     * "crescer" um slot) pode travar dentro do próprio driver
+     * (cuMemFreeHost), verificado via gdb: uma dirty scheduler thread
+     * ficava presa dentro de libcuda.so.1.1, e uma segunda thread dirty
+     * ficava presa esperando um mutex interno do driver que a primeira
+     * nunca liberava. Isso não acontece com cudaMallocHost sozinho.
+     * Trade-off aceito: o buffer antigo do slot (se houver) fica retido,
+     * nunca liberado — no máximo FLAWD_POOL_SLOTS buffers "perdidos" por
+     * pool, ao longo de toda a vida do processo, não por chamada. */
     cudaError_t e = cudaMallocHost(&slot->buf, needed);
     if (e != cudaSuccess) {
         pthread_mutex_unlock(&pool->lock);
@@ -1936,11 +1944,11 @@ static CUdeviceptr device_pool_acquire(DevicePool *pool, size_t needed) {
     }
 
     DeviceSlot *slot = &pool->slots[free_idx];
-    if (slot->ptr != 0) {
-        cuMemFree(slot->ptr);
-        slot->ptr      = 0;
-        slot->capacity = 0;
-    }
+    /* Mesmo raciocínio de pinned_pool_acquire acima: nunca cuMemFree aqui
+     * ao crescer um slot, para evitar o padrão free+alloc que trava no
+     * driver CUDA do WSL2. O ponteiro antigo do slot (se houver) fica
+     * retido sem ser liberado — no máximo FLAWD_POOL_SLOTS ponteiros
+     * "perdidos" ao longo de toda a vida do processo. */
     CUresult e = cuMemAlloc(&slot->ptr, needed);
     if (e != CUDA_SUCCESS) {
         pthread_mutex_unlock(&pool->lock);
